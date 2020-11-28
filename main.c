@@ -5,10 +5,8 @@
 
 #include <unistd.h>
 
-#include "msd/bootcode.h"
-#include "msd/start.h"
-#include "msd/bootcode4.h"
-#include "msd/start4.h"
+#include "boot/bootcode.h"
+#include "boot/start.h"
 
 /* Assume BSD without native fmemopen() if doesn't seem to be glibc */
 #if defined(__APPLE__) || (!defined(_GNU_SOURCE) && (!defined(_POSIX_C_SOURCE) || _POSIX_C_SOURCE < 200809L))
@@ -18,7 +16,6 @@
 int signed_boot = 0;
 int verbose = 0;
 int loop = 0;
-int overlay = 0;
 long delay = 500;
 char * directory = NULL;
 char pathname[18] = {0};
@@ -26,9 +23,8 @@ uint8_t targetPortNo = 99;
 
 int out_ep;
 int in_ep;
-int bcm2711;
 
-static FILE * check_file(const char * dir, const char *fname, int use_fmem);
+static FILE * check_file(const char * dir, const char *fname);
 static int second_stage_prep(FILE *fp, FILE *fp_sig);
 
 typedef struct MESSAGE_S {
@@ -53,9 +49,6 @@ void usage(int error)
 	fprintf(dest, "rpiboot -d [directory]   : Boot the device using the boot files in 'directory'\n");
 	fprintf(dest, "Further options:\n");
 	fprintf(dest, "        -l               : Loop forever\n");
-	fprintf(dest, "        -o               : Use files from overlay subdirectory if they exist (when using a custom directory)\n");
-	fprintf(dest, "                           USB Path (1-1.3.2 for example) is shown in verbose mode.\n");
-	fprintf(dest, "                           (bootcode.bin is always preloaded from the base directory)\n");
 	fprintf(dest, "        -m delay         : Microseconds delay between checking for new devices (default 500)\n");
 	fprintf(dest, "        -v               : Verbose\n");
 	fprintf(dest, "        -s               : Signed using bootsig.bin\n");
@@ -73,33 +66,17 @@ libusb_device_handle * LIBUSB_CALL open_device_with_vid(
 	struct libusb_device *dev;
 	struct libusb_device_handle *handle = NULL;
 	uint32_t i = 0;
-	int r, j, len;
-	uint8_t path[8];	// Needed for libusb_get_port_numbers
+	int r;
 	uint8_t portNo = 0;
 
 	if (libusb_get_device_list(ctx, &devs) < 0)
 		return NULL;
 
 	while ((dev = devs[i++]) != NULL) {
-		len = 0;
 		struct libusb_device_descriptor desc;
 		r = libusb_get_device_descriptor(dev, &desc);
 		if (r < 0)
 			goto out;
-
-		if(overlay || verbose == 2)
-		{
-			r = libusb_get_port_numbers(dev, path, sizeof(path));
-			len = snprintf(&pathname[len], 18-len, "%d", libusb_get_bus_number(dev));
-			if (r > 0) {
-				len += snprintf(&pathname[len], 18-len, "-");
-				len += snprintf(&pathname[len], 18-len, "%d", path[0]);
-				for (j = 1; j < r; j++)
-				{
-					len += snprintf(&pathname[len], 18-len, ".%d", path[j]);
-				}
-			}
-		}
 
 		/*
 		  http://libusb.sourceforge.net/api-1.0/group__dev.html#ga14879a0ea7daccdcddb68852d86c00c4
@@ -114,11 +91,10 @@ libusb_device_handle * LIBUSB_CALL open_device_with_vid(
 			printf("Found device %u idVendor=0x%04x idProduct=0x%04x\n", i, desc.idVendor, desc.idProduct);
 			printf("Bus: %d, Device: %d Path: %s\n",libusb_get_bus_number(dev), libusb_get_device_address(dev), pathname);
 		}
-		
+
 		if (desc.idVendor == vendor_id) {
 			if(desc.idProduct == 0x2763 ||
-			   desc.idProduct == 0x2764 ||
-			   desc.idProduct == 0x2711)
+			   desc.idProduct == 0x2764)
 			{
 				FILE *fp_second_stage = NULL;
 				FILE *fp_sign = NULL;
@@ -127,23 +103,19 @@ libusb_device_handle * LIBUSB_CALL open_device_with_vid(
 				if(verbose == 2)
 					printf("Found candidate Compute Module...");
 
-				bcm2711 = (desc.idProduct == 0x2711);
-				if (bcm2711)
-					second_stage = "bootcode4.bin";
-				else
-					second_stage = "bootcode.bin";
+				second_stage = "bootcode.bin";
 
-				fp_second_stage = check_file(directory, second_stage, 1);
+				fp_second_stage = check_file(directory, second_stage);
 				if (!fp_second_stage)
 				{
 					fprintf(stderr, "Failed to open %s\n", second_stage);
 					exit(1);
 				}
 
-				if (signed_boot && !bcm2711) // Signed boot use a different mechanism on BCM2711
+				if (signed_boot) // Signed boot use a different mechanism on BCM2711
 				{
 					const char *sig_file = "bootcode.sig";
-					fp_sign = check_file(directory, sig_file, 1);
+					fp_sign = check_file(directory, sig_file);
 					if (!fp_sign)
 					{
 						fprintf(stderr, "Unable to open '%s'\n", sig_file);
@@ -319,10 +291,6 @@ void get_options(int argc, char *argv[])
 		{
 			verbose = 1;
 		}
-		else if(strcmp(*argv, "-o") == 0)
-		{
-			overlay = 1;
-		}
 		else if(strcmp(*argv, "-m") == 0)
 		{
 			argv++; argc--;
@@ -372,10 +340,6 @@ void get_options(int argc, char *argv[])
 		}
 
 		argv++; argc--;
-	}
-	if(overlay&&!directory)
-	{
-		usage(1);
 	}
 	if(!delay)
 	{
@@ -456,7 +420,7 @@ int second_stage_boot(libusb_device_handle *usb_device)
 }
 
 
-FILE * check_file(const char * dir, const char *fname, int use_fmem)
+FILE * check_file(const char * dir, const char *fname)
 {
 	FILE * fp = NULL;
 	char path[256];
@@ -470,21 +434,6 @@ FILE * check_file(const char * dir, const char *fname, int use_fmem)
 
 	if(dir)
 	{
-		if(overlay && (pathname[0] != 0) &&
-				(strcmp(fname, "bootcode4.bin") != 0) &&
-				(strcmp(fname, "bootcode.bin") != 0))
-		{
-			strcpy(path, dir);
-			strcat(path, "/");
-			strcat(path, pathname);
-			strcat(path, "/");
-			strcat(path, fname);
-			fp = fopen(path, "rb");
-			if (fp)
-				printf("Loading: %s\n", path);
-			memset(path, 0, sizeof(path));
-		}
-
 		if (fp == NULL)
 		{
 			strcpy(path, dir);
@@ -496,24 +445,13 @@ FILE * check_file(const char * dir, const char *fname, int use_fmem)
 		}
 	}
 
-	// Failover to fmem unless use_fmem is zero in which case this function
-	// is being used to check if a file exists.
-	if(fp == NULL && use_fmem)
+    /* Load VideoCore firmware files from embedded files */
+	if(fp == NULL)
 	{
-		if (bcm2711)
-		{
-			if(strcmp(fname, "bootcode4.bin") == 0)
-				fp = fmemopen(msd_bootcode4_bin, msd_bootcode4_bin_len, "rb");
-			else if(strcmp(fname, "start4.elf") == 0)
-				fp = fmemopen(msd_start4_elf, msd_start4_elf_len, "rb");
-		}
-		else
-		{
-			if(strcmp(fname, "bootcode.bin") == 0)
-				fp = fmemopen(msd_bootcode_bin, msd_bootcode_bin_len, "rb");
-			else if(strcmp(fname, "start.elf") == 0)
-				fp = fmemopen(msd_start_elf, msd_start_elf_len, "rb");
-		}
+		if(strcmp(fname, "bootcode.bin") == 0)
+			fp = fmemopen(boot_bootcode_bin, boot_bootcode_bin_len, "rb");
+		else if(strcmp(fname, "start.elf") == 0)
+			fp = fmemopen(boot_start_elf, boot_start_elf_len, "rb");
 		if (fp)
 			printf("Loading embedded: %s\n", fname);
 	}
@@ -556,7 +494,7 @@ int file_server(libusb_device_handle * usb_device)
 			case 0: // Get file size
 				if(fp)
 					fclose(fp);
-				fp = check_file(directory, message.fname, 1);
+				fp = check_file(directory, message.fname);
 				if(strlen(message.fname) && fp != NULL)
 				{
 					int file_size;
@@ -652,30 +590,16 @@ int main(int argc, char *argv[])
 	// flush immediately
 	setbuf(stdout, NULL);
 
-	// If the boot directory is specified then check that it contains bootcode files.
 	if (directory)
 	{
-		FILE *f, *f4;
+		FILE *f;
 
 		if (verbose)
 			printf("Boot directory '%s'\n", directory);
 
-		f = check_file(directory, "bootcode.bin", 0);
-		f4 = check_file(directory, "bootcode4.bin", 0);
-		if (!f && !f4)
-		{
-			fprintf(stderr, "No 'bootcode' files found in '%s'\n", directory);
-			usage(1);
-		}
-
-		if (f)
-			fclose(f);
-		if (f4)
-			fclose(f4);
-
 		if (signed_boot)
 		{
-			f = check_file(directory, "bootsig.bin", 0);
+			f = check_file(directory, "bootsig.bin");
 			if (!f)
 			{
 				fprintf(stderr, "Unable to open 'bootsig.bin' from %s\n", directory);
@@ -706,7 +630,7 @@ int main(int argc, char *argv[])
 	{
 		int last_serial = -1;
 
-		printf("Waiting for BCM2835/6/7/2711...\n");
+		printf("Waiting for BCM2835...\n");
 
 		// Wait for a device to get plugged in
 		do

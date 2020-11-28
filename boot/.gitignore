@@ -1,0 +1,4 @@
+bootcode.bin
+bootcode.h
+start.elf
+start.h
